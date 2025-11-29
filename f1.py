@@ -726,7 +726,7 @@ if st.button("Run RAG", key="run_rag_ui"):
                         if gem_ans:
                               st.subheader("Answer (Gemini)")
                               st.write(gem_ans)
-                         else:
+                        else:
                                 st.warning(f"Gemini not available: {gem_meta}")
                                 # fallback
                                 st.subheader("Fallback (Extractive, humanized)")
