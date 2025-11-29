@@ -722,15 +722,15 @@ if st.button("Run RAG", key="run_rag_ui"):
                 if gemini_checkbox:
                     try:
                         st.info("Calling Gemini (this may take several seconds)...")
-                      gem_ans, gem_meta = call_gemini_generate_safe(ctx_text, user_question, timeout_sec=12)
-                      if gem_ans:
-                          st.subheader("Answer (Gemini)")
-                          st.write(gem_ans)
-                     else:
-                            st.warning(f"Gemini not available: {gem_meta}")
-                            # fallback
-                            st.subheader("Fallback (Extractive, humanized)")
-                            st.markdown(format_human_answer_from_retrieved(retrieved, user_question, df2))
+                        gem_ans, gem_meta = call_gemini_generate_safe(ctx_text, user_question, timeout_sec=12)
+                        if gem_ans:
+                              st.subheader("Answer (Gemini)")
+                              st.write(gem_ans)
+                         else:
+                                st.warning(f"Gemini not available: {gem_meta}")
+                                # fallback
+                                st.subheader("Fallback (Extractive, humanized)")
+                                st.markdown(format_human_answer_from_retrieved(retrieved, user_question, df2))
                     except Exception as e:
                         st.error(f"Gemini call failed: {e}")
                         gemini_answer = None
