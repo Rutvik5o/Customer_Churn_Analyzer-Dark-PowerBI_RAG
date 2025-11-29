@@ -528,46 +528,65 @@ if run_analysis:
     user_question = st.text_input("Ask a question about the dataset (e.g., 'Which contract has highest churn?')", key="rag_question")
     top_k = st.number_input("Top-K passages", min_value=1, max_value=10, value=3, key="rag_topk")
     gemini_checkbox = st.checkbox("Use Gemini (if configured in secrets)", value=True, key="use_gemini")
+# ---------- RAG (debug-friendly, stores index in session_state) ----------
+st.markdown("---")
+st.markdown('<div class="chart-card"><strong>🔎 RAG Q&A (debug)</strong></div>', unsafe_allow_html=True)
 
-    if st.button("Run RAG", key="run_rag"):
-        if not user_question or not user_question.strip():
-            st.warning("Please enter a question.")
-        else:
-            if vect is None:
-                st.error("Could not build retriever (no text passages).")
+# Build corpus only once and store in session_state to avoid re-building on rerun
+if "rag_passages" not in st.session_state:
+    st.session_state["rag_passages"] = build_corpus_from_df(df2)  # df2 is your filtered dataframe used earlier
+if "rag_vect" not in st.session_state or "rag_mat" not in st.session_state:
+    try:
+        st.session_state["rag_vect"], st.session_state["rag_mat"] = build_tfidf_index(st.session_state["rag_passages"])
+    except Exception as e:
+        st.error(f"Failed to build TF-IDF index: {e}")
+        st.session_state["rag_vect"], st.session_state["rag_mat"] = None, None
+
+user_question = st.text_input("Ask a question about the dataset (e.g., 'Which contract has highest churn?')", key="rag_q_debug")
+top_k = st.number_input("Top-K passages", min_value=1, max_value=10, value=3, key="rag_k_debug")
+use_gemini = st.checkbox("Use Gemini (if configured)", value=False, key="rag_use_gemini_debug")
+
+if st.button("Run RAG (Debug)", key="run_rag_debug"):
+    # Basic validation
+    if not user_question or not user_question.strip():
+        st.warning("Please enter a question.")
+    elif st.session_state["rag_vect"] is None or st.session_state["rag_mat"] is None:
+        st.error("Retriever not ready. Check TF-IDF index build above.")
+    else:
+        # Run retrieval + generation inside try/except and show spinner
+        try:
+            with st.spinner("Retrieving top-k passages..."):
+                retrieved = retrieve_top_k(user_question, st.session_state["rag_vect"], st.session_state["rag_mat"], st.session_state["rag_passages"], k=top_k)
+            if not retrieved:
+                st.info("No relevant passages found.")
             else:
-                with st.spinner("Retrieving relevant passages..."):
-                    retrieved = retrieve_top_k(user_question, vect, mat, passages, k=top_k)
-                if not retrieved:
-                    st.info("No relevant passages found for this question.")
+                st.success(f"Retrieved {len(retrieved)} passages.")
+                ctx_text = ""
+                for score, passage, idx in retrieved:
+                    st.markdown(f"**score:** {score:.3f}")
+                    st.write(passage)
+                    ctx_text += passage + "\n\n"
+
+                # If user wants Gemini, try but catch exceptions
+                gemini_answer = None
+                if use_gemini:
+                    try:
+                        st.info("Calling Gemini — this may take a few seconds.")
+                        gemini_answer = call_gemini_generate(ctx_text, user_question)
+                    except Exception as e:
+                        st.error(f"Gemini call failed: {e}")
+                        gemini_answer = None
+
+                if gemini_answer:
+                    st.subheader("Answer (Gemini)")
+                    st.write(gemini_answer)
                 else:
-                    st.success(f"Found {len(retrieved)} relevant passages.")
-                    context_text = ""
-                    st.subheader("Retrieved context")
-                    for score, passage, idx in retrieved:
-                        st.markdown(f"**Score:** {score:.3f}")
-                        st.markdown(textwrap.fill(passage, width=140))
-                        st.markdown("---")
-                        context_text += passage + "\n\n"
-
-                    gemini_answer = None
-                    if gemini_checkbox:
-                        try:
-                            gemini_answer = call_gemini_generate(context_text, user_question)
-                        except Exception as e:
-                            st.error(f"Gemini call error: {e}")
-                            gemini_answer = None
-
-                    if gemini_answer:
-                        st.subheader("Answer from Gemini")
-                        st.write(gemini_answer)
+                    st.subheader("Fallback extractive answer")
+                    summary = extractive_summary_from_passages([p for _, p, _ in retrieved], user_question, max_sentences=4)
+                    if summary:
+                        st.write(summary)
                     else:
-                        st.subheader("Extractive fallback answer")
-                        summary = extractive_summary_from_passages([p for _, p, _ in retrieved], user_question, max_sentences=4)
-                        if summary:
-                            st.write(summary)
-                        else:
-                            st.info("No extractive sentences found. See retrieved passages above for context.")
-
-else:
-    st.info("👈 Configure columns + filters → Click **Run Analysis** 🚀")
+                        st.info("No extractive sentences found.")
+        except Exception as err:
+            st.error("RAG pipeline failed — see details below.")
+            st.exception(err)
