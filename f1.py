@@ -1,25 +1,21 @@
 # app.py
-# Combined: PowerBI-style Dark Churn Dashboard + RAG Q&A with Gemini (optional)
+# Customer Churn Analyzer — Dark PowerBI + RAG (TF-IDF + Gemini safe)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import os
-import textwrap
+import threading
+import time
 
-# Optional Gemini client - import lazily (so app runs if package missing)
+# Optional Gemini client - import lazily
 try:
-    import google.generativeai as genai  # pip: google-generativeai
+    import google.generativeai as genai  # pip: google-generativeai==0.8.5
     _HAS_GEMINI = True
 except Exception:
     genai = None
     _HAS_GEMINI = False
-
-# TF-IDF retrieval
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 # ------------------------- PAGE CONFIG -------------------------------------
 st.set_page_config(
@@ -28,11 +24,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ------------------------- COLOR PALETTE ----------------------------------
+# ------------------------- PALETTE & ACCENT --------------------------------
 PALETTE = px.colors.qualitative.Plotly
 ACCENT = "#0ea5a3"
 
-# ------------------------- DARK THEME CSS ---------------------------------
+# ------------------------- THEME CSS ---------------------------------------
 CSS = r'''
 <style>
 :root{--bg:#0b1220;--card:#0f1724;--muted:#9aa4b2;--accent:#0ea5a3;--accent-2:#06b6d4;}
@@ -57,13 +53,13 @@ section[data-testid="stSidebar"] .css-1lcbmhc{ background: linear-gradient(180de
 .metric-value {font-size:1.45rem; font-weight:700; color: #e6f7f2}
 .info-card {background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border-radius:10px; padding:12px;}
 .small-muted {color:var(--muted); font-size:13px}
-.stButton>button{ background: linear-gradient(90deg,var(--accent),var(--accent-2)); color:white; border:none; padding:8px 18px; border-radius:10px; font-weight:600; box-shadow: 0 6px 20px rgba(14,165,163,0.18); }
-.chart-card { padding:10px; background: linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.005)); border-radius:10px; box-shadow: 0 10px 30px rgba(2,6,23,0.6); border: 1px solid rgba(255,255,255,0.02); }
+.stButton>button{ background: linear-gradient(90deg,var(--accent),var(--accent-2)); color:white; border:none; padding:8px 18px; border-radius:10px; font-weight:600; box-shadow: 0 6px 20px rgba(14,165,163,0.18);}
+.chart-card { padding:10px; background: linear-gradient(180deg, rgba(255,255,255,0.01), rgba(255,255,255,0.005)); border-radius:10px; box-shadow: 0 10px 30px rgba(2,6,23,0.6); border: 1px solid rgba(255,255,255,0.02);}
 </style>
 '''
 st.markdown(CSS, unsafe_allow_html=True)
 
-# ------------------------- HEADER -----------------------------------------
+# ------------------------- HEADER ------------------------------------------
 st.markdown(
     '''
     <div class="header-card">
@@ -139,10 +135,17 @@ for i, s in enumerate(possible_segments):
     vals = sorted(df[s].dropna().unique().tolist())
     if vals:
         default_vals = vals[:min(3, len(vals))]
-        segment_filters[s] = st.sidebar.multiselect("🔧 {}".format(s), options=vals, default=default_vals, key="seg_power_{}".format(i))
+        segment_filters[s] = st.sidebar.multiselect(f"🔧 {s}", options=vals, default=default_vals, key=f"seg_power_{i}")
 
 st.sidebar.markdown("---")
 run_analysis = st.sidebar.button("🚀 Run Analysis")
+
+# RAG indexing params in sidebar (configurable)
+st.sidebar.markdown("---")
+st.sidebar.header("🧠 RAG / Retriever settings")
+max_corpus_rows = st.sidebar.number_input("Max corpus rows (for TF-IDF)", min_value=200, max_value=7000, value=2000, step=200)
+max_tfidf_features = st.sidebar.number_input("TF-IDF max features", min_value=2000, max_value=20000, value=8000, step=1000)
+st.sidebar.markdown('<div class="small-muted">If your app resets, lower these values and retry.</div>', unsafe_allow_html=True)
 
 # ------------------------- HELPERS ---------------------------------------
 def normalize_churn(series):
@@ -171,93 +174,65 @@ def dark_plotly_layout(fig, height=420, showlegend=True, rotate_x=False):
         pass
     return fig
 
-# ------------------------- RAG Helpers -----------------------------------
-# Performance-safe RAG defaults
-MAX_RAG_ROWS = 2000
-MAX_PASSAGE_CHARS = 1200
-TFIDF_MAX_FEATURES = 5000
-
-def row_to_text(row: pd.Series):
-    parts = []
-    for k, v in row.items():
-        if pd.isna(v):
-            continue
-        if isinstance(v, (int, float, np.integer, np.floating)):
-            parts.append(f"{k}: {v}")
-        else:
-            s = str(v).strip()
-            if s:
-                parts.append(f"{k}: {s}")
-    return " | ".join(parts)
-
-def build_corpus_from_df_sampled(df_local, max_rows=MAX_RAG_ROWS, max_chars=MAX_PASSAGE_CHARS):
-    if df_local is None or df_local.shape[0] == 0:
-        return []
-    n = len(df_local)
-    if n <= max_rows:
-        sample_df = df_local
-    else:
-        head_n = min(300, max_rows // 10)
-        tail_n = max_rows - head_n
-        head_df = df_local.head(head_n)
-        tail_df = df_local.sample(n=tail_n, random_state=42)
-        sample_df = pd.concat([head_df, tail_df], ignore_index=True)
+# ------------------------- RAG / TF-IDF (cached) --------------------------
+@st.cache_data(ttl=60*60, show_spinner=False)
+def cached_build_corpus_and_index(df_for_index, max_rows, max_features):
+    """
+    Build text corpus and TF-IDF vectorizer (cached).
+    Returns: passages(list), vect, mat (sparse)
+    """
+    # build simple text passages from rows
+    rows = min(len(df_for_index), int(max_rows))
     passages = []
-    for i in range(len(sample_df)):
-        txt = row_to_text(sample_df.iloc[i])
-        if not txt:
-            continue
-        if len(txt) > max_chars:
-            txt = txt[:max_chars] + " ...[truncated]"
-        passages.append(txt)
-    return passages
-
-def build_tfidf_index_safe(passages, max_features=TFIDF_MAX_FEATURES):
+    for i in range(rows):
+        row = df_for_index.iloc[i]
+        parts = []
+        for k, v in row.items():
+            if pd.isna(v):
+                continue
+            s = str(v).strip()
+            if s == "":
+                continue
+            parts.append(f"{k}: {s}")
+        txt = " | ".join(parts)
+        if txt:
+            passages.append(txt)
     if not passages:
-        return None, None
-    vect = TfidfVectorizer(stop_words="english", max_features=max_features)
+        return passages, None, None
+    # lazy import sklearn here
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+    except Exception as e:
+        # If sklearn not installed, return Nones so UI can continue without retriever
+        return passages, None, None
+    vect = TfidfVectorizer(stop_words="english", max_features=int(max_features))
     try:
         mat = vect.fit_transform(passages)
-    except Exception as e:
-        st.error(f"TF-IDF build failed: {e}")
-        return None, None
-    return vect, mat
+    except Exception:
+        return passages, None, None
+    return passages, vect, mat
 
-def retrieve_top_k_from_index(query, vect, mat, passages, k=3):
-    if vect is None or mat is None:
+def safe_retrieve_top_k(query, vect, mat, passages, k=3):
+    """
+    Retrieve top-k passages using cosine similarity.
+    """
+    if vect is None or mat is None or not passages:
         return []
-    qv = vect.transform([query])
-    sims = cosine_similarity(qv, mat).flatten()
-    top_idx = sims.argsort()[::-1][:k]
-    results = []
-    for idx in top_idx:
-        if sims[idx] <= 0:
-            continue
-        results.append((float(sims[idx]), passages[idx], idx))
-    return results
+    try:
+        from sklearn.metrics.pairwise import cosine_similarity
+        qv = vect.transform([query])
+        sims = cosine_similarity(qv, mat).flatten()
+        top_idx = sims.argsort()[::-1][:k]
+        results = []
+        for idx in top_idx:
+            if sims[idx] <= 0:
+                continue
+            results.append((float(sims[idx]), passages[idx], int(idx)))
+        return results
+    except Exception:
+        return []
 
-def extractive_summary_from_passages(passages, question, max_sentences=3):
-    q_tokens = set([t.lower() for t in question.split() if len(t) > 2])
-    scored_sentences = []
-    for p in passages:
-        sents = [s.strip() for s in p.replace("|", ". ").split(".") if s.strip()]
-        for s in sents:
-            stokens = set([t.lower() for t in s.split() if len(t) > 2])
-            score = len(q_tokens.intersection(stokens))
-            if any(ch.isdigit() for ch in s):
-                score += 0.2
-            if score > 0:
-                scored_sentences.append((score, s))
-    scored_sentences.sort(key=lambda x: x[0], reverse=True)
-    top = [s for _, s in scored_sentences[:max_sentences]]
-    return " ".join(top) if top else None
-
-# robust_gemini_helpers.py (paste into your app)
-
-import time
-import threading
-
-# ------------- init (safe) -------------
+# ------------------------- GEMINI HELPERS (robust) ------------------------
 def init_gemini_safe():
     """
     Initialize the google.generativeai client if available and key present.
@@ -278,37 +253,34 @@ def init_gemini_safe():
     except Exception as e:
         return False, f"gemini configure failed: {e}"
 
-# ------------- call with timeout & parsing -------------
 def call_gemini_generate_safe(context_text: str, user_question: str, model_name="gemini-1.5-flash", timeout_sec=12):
     """
-    Calls Gemini and returns a human-readable string, or None on failure.
-    - Tries to init the SDK (safe)
-    - Uses a background thread to enforce timeout (so Streamlit spinner won't block forever)
-    - Parses common response shapes (response.text, response.candidates[0].content, etc.)
+    Calls Gemini and returns (text, meta). On failure returns (None, reason).
+    Uses a background thread to enforce timeout.
     """
     ok, reason = init_gemini_safe()
     if not ok:
-        # debug info: return reason so UI can show it if desired
         return None, f"Gemini init failed: {reason}"
 
     result_container = {"resp": None, "err": None}
+
     def worker():
         try:
-            # new + old SDKs differ; try the higher-level approach first
             model = genai.GenerativeModel(model_name)
-            prompt = f"""You are a concise data-analytics assistant. Use ONLY the context below to answer the QUESTION.
-Context:
+            prompt = f"""You are a customer churn analytics assistant.
+Use ONLY the context below — do NOT hallucinate. Answer concisely and reference context.
+
+CONTEXT:
 {context_text}
 
-Question:
+QUESTION:
 {user_question}
 
 Provide:
-1) A short direct answer in plain English.
-2) One-line reasoning referencing the context.
-3) Two short actionable recommendations.
+1) Direct answer (1-2 short sentences).
+2) Short reasoning referencing context.
+3) 2 short actionable insights.
 """
-            # `generate_content` for google-generativeai 0.8.5
             resp = model.generate_content(prompt)
             result_container["resp"] = resp
         except Exception as e:
@@ -318,27 +290,20 @@ Provide:
     thread.start()
     thread.join(timeout=timeout_sec)
     if thread.is_alive():
-        # still running -> timed out; we won't block further
         return None, f"Gemini call timed out after {timeout_sec}s"
-
     if result_container["err"] is not None:
         return None, f"Gemini call error: {repr(result_container['err'])}"
-
     resp = result_container["resp"]
     if resp is None:
         return None, "Gemini returned no response object."
 
-    # Parse common shapes: resp.text or resp.candidates / resp.output / resp.result
+    # Parse common shapes:
     try:
-        # 0.8.5 returns objects with .text sometimes
         if hasattr(resp, "text") and resp.text:
             return str(resp.text), "OK (text)"
-        # some versions wrap content in .candidates or .output
         if hasattr(resp, "candidates") and getattr(resp, "candidates"):
             cand = resp.candidates[0]
-            # candidate may have .content or .text
             if hasattr(cand, "content") and getattr(cand, "content"):
-                # content might be dictionary or object -> stringify
                 return str(cand.content), "OK (candidates.content)"
             if hasattr(cand, "text") and getattr(cand, "text"):
                 return str(cand.text), "OK (candidates.text)"
@@ -346,98 +311,74 @@ Provide:
             return str(resp.output), "OK (output)"
     except Exception as e:
         return None, f"Error parsing Gemini response: {e}"
-
-    # Last resort: stringify whole resp
     try:
         return str(resp), "OK (stringified)"
     except Exception as e:
         return None, f"Could not stringify Gemini response: {e}"
 
-
-# ------------- humanize extracted retrieved passages -------------
 def format_human_answer_from_retrieved(retrieved, question, df_filtered=None, max_examples=3):
     """
-    Builds a human-readable explanation from retrieved passages (list of (score, passage, idx)).
-    Includes: direct answer attempt, reasoning, short examples from data.
+    Builds a human-friendly explanation from retrieved passages.
     """
-    # 1) Compose direct observation (very simple heuristic)
     top_passages = retrieved[:max_examples]
-    # create short bullets
     bullets = []
     for score, passage, idx in top_passages:
         short = passage
         if len(short) > 240:
             short = short[:240].rsplit(" ", 1)[0] + "..."
         bullets.append(f"- (score {score:.3f}) {short}")
-
-    # 2) Try to infer a direct English answer using small heuristics
-    # Example: if question contains 'which contract' or 'highest churn'
     qlow = question.lower()
     inferred = None
-    if "highest churn" in qlow or "which contract" in qlow or "which plan" in qlow:
-        # scan passages for 'Contract: X' and 'Churn: Yes' frequency
+    if any(x in qlow for x in ["highest churn", "which contract", "which plan", "most churn"]):
         cnt = {}
         for _, p, _ in retrieved:
-            if "contract:" in p.lower():
-                # crude parse
-                try:
-                    parts = [s.strip() for s in p.split("|")]
-                    contract = None
-                    churn = None
-                    for part in parts:
-                        k = part.split(":", 1)
-                        if len(k) == 2:
-                            key = k[0].strip().lower()
-                            val = k[1].strip()
-                            if key == "contract":
-                                contract = val
-                            if key == "churn":
-                                churn = val.lower()
-                    if contract:
-                        key = contract
-                        if key not in cnt:
-                            cnt[key] = {"yes":0, "no":0}
-                        if churn and "y" in churn:
-                            cnt[key]["yes"] += 1
-                        else:
-                            cnt[key]["no"] += 1
-                except Exception:
-                    pass
+            parts = [s.strip() for s in p.split("|")]
+            contract = None
+            churn = None
+            for part in parts:
+                k = part.split(":", 1)
+                if len(k) == 2:
+                    key = k[0].strip().lower()
+                    val = k[1].strip()
+                    if key == "contract":
+                        contract = val
+                    if key == "churn":
+                        churn = val.lower()
+            if contract:
+                key = contract
+                if key not in cnt:
+                    cnt[key] = {"yes": 0, "no": 0}
+                if churn and ("y" in churn):
+                    cnt[key]["yes"] += 1
+                else:
+                    cnt[key]["no"] += 1
         if cnt:
             best = sorted(cnt.items(), key=lambda t: t[1]["yes"], reverse=True)[0]
-            inferred = f"It looks like customers with contract '{best[0]}' have a higher observed churn in retrieved passages (churned {best[1]['yes']} vs retained {best[1]['no']})."
-
-    # 3) Build final human text
+            inferred = f"From retrieved records, contract '{best[0]}' shows higher churn (churned {best[1]['yes']} vs retained {best[1]['no']})."
     human = []
     human.append(f"**Question:** {question}")
     if inferred:
         human.append(f"**Quick answer (inferred):** {inferred}")
     else:
-        human.append("**Quick answer:** Based on the retrieved records, I couldn't compute an exact aggregated metric here; see sample records below.")
-    human.append("**Reasoning / evidence from dataset (top passages):**")
+        human.append("**Quick answer:** Based on the retrieved records, here are supporting examples:")
+    human.append("**Reasoning / evidence (top passages):**")
     human.extend(bullets)
     if df_filtered is not None:
-        human.append(f"**Notes:** Analysis used filtered dataset with {len(df_filtered):,} rows.")
-    human.append("**Actionable suggestions:** 1) Inspect the top contract groups for churn frequency; 2) Run an aggregated pivot 'Contract vs churn rate' in the dashboard.")
+        human.append(f"**Notes:** This used a filtered dataset of {len(df_filtered):,} rows.")
+    human.append("**Actionable suggestions:** 1) Inspect aggregate churn by contract; 2) Target high-churn cohorts with retention offers.")
     return "\n\n".join(human)
 
-
-# ------------------------- MAIN: RUN ANALYSIS ----------------------------------
+# ------------------------- RUN ANALYSIS ----------------------------------
 if run_analysis:
-    # compute filtered df2 and store in session_state (so RAG uses it)
     df2 = df.copy()
+
+    # apply segment filters safely
     for s, selvals in segment_filters.items():
         if selvals:
             try:
                 df2 = df2[df2[s].isin(selvals)]
             except Exception:
                 st.warning(f"Filter {s} could not be applied (type mismatch).")
-
-    # persist filtered df
-    st.session_state["filtered_df"] = df2.copy()
-    # clear cached RAG index so it rebuilds for new filter
-    for k in ["rag_passages", "rag_vect", "rag_mat", "_rag_source_sig"]:
-        st.session_state.pop(k, None)
 
     st.markdown(f'<div class="info-card"><strong>📋 Filtered Dataset</strong> • {len(df2)} rows</div>', unsafe_allow_html=True)
     st.dataframe(df2.head(8), use_container_width=True, height=200)
@@ -588,7 +529,7 @@ if run_analysis:
 
     st.markdown("---")
 
-    # Payment method & internet service
+    # Payment method & internet service charts
     c1, c2 = st.columns(2)
     with c1:
         st.markdown('<div class="chart-card"><strong>💳 Churn by Payment Method</strong></div>', unsafe_allow_html=True)
@@ -670,81 +611,59 @@ if run_analysis:
     except Exception:
         pass
 
-# ------------------ RAG UI (fast, safe, single block) --------------------
-st.markdown("---")
-st.markdown('<div class="chart-card"><strong>🔎 RAG Q&A (ask about your dataset)</strong></div>', unsafe_allow_html=True)
+    # ------------------ RAG UI (below dashboard) --------------------
+    st.markdown("---")
+    st.markdown('<div class="chart-card"><strong>🔎 RAG Q&A (ask about your uploaded dataset)</strong></div>', unsafe_allow_html=True)
 
-# choose source df (prefer filtered in session_state)
-_df_for_rag = st.session_state.get("filtered_df", df)
+    # Build cached corpus & index
+    with st.spinner("Preparing retriever (cached)..."):
+        passages, rag_vect, rag_mat = cached_build_corpus_and_index(df2, max_corpus_rows, max_tfidf_features)
+    st.session_state["rag_passages"] = passages
+    st.session_state["rag_vect"] = rag_vect
+    st.session_state["rag_mat"] = rag_mat
 
-# create a small signature to know when to rebuild
-_source_sig = (tuple(_df_for_rag.columns), len(_df_for_rag))
+    # RAG input UI
+    user_question = st.text_input("Ask a question about the dataset (e.g., 'Which contract has highest churn?')", key="rag_question_ui")
+    top_k = st.number_input("Top-K passages", min_value=1, max_value=10, value=3, key="rag_topk_ui")
+    use_gemini = st.checkbox("Use Gemini (if configured in secrets)", value=False, key="use_gemini_ui")
 
-if st.session_state.get("_rag_source_sig") != _source_sig:
-    st.session_state["_rag_source_sig"] = _source_sig
-    st.session_state["rag_passages"] = build_corpus_from_df_sampled(_df_for_rag, max_rows=MAX_RAG_ROWS, max_chars=MAX_PASSAGE_CHARS)
-    st.session_state["rag_vect"], st.session_state["rag_mat"] = build_tfidf_index_safe(st.session_state.get("rag_passages", []), max_features=TFIDF_MAX_FEATURES)
-
-if "rag_passages" not in st.session_state:
-    st.session_state["rag_passages"] = []
-if "rag_vect" not in st.session_state:
-    st.session_state["rag_vect"] = None
-if "rag_mat" not in st.session_state:
-    st.session_state["rag_mat"] = None
-
-st.caption(f"Indexing: up to {MAX_RAG_ROWS} rows sampled • truncating long rows • TF-IDF max features: {TFIDF_MAX_FEATURES}")
-
-user_question = st.text_input("Ask a question about the dataset (e.g., 'Which contract has highest churn?')", key="rag_ui_question")
-top_k = st.number_input("Top-K passages", min_value=1, max_value=10, value=3, key="rag_ui_topk")
-gemini_checkbox = st.checkbox("Use Gemini (if configured in secrets) — WARNING: may block/wait", value=False, key="rag_ui_gemini")
-
-if st.button("Run RAG", key="run_rag_ui"):
-    if not user_question or not user_question.strip():
-        st.warning("Please enter a question.")
-    elif st.session_state["rag_vect"] is None or st.session_state["rag_mat"] is None or len(st.session_state["rag_passages"]) == 0:
-        st.error("Retriever not ready or no passages indexed. Try re-running analysis or reduce MAX_RAG_ROWS.")
-    else:
-        try:
-            with st.spinner("Retrieving relevant passages..."):
-                retrieved = retrieve_top_k_from_index(user_question, st.session_state["rag_vect"], st.session_state["rag_mat"], st.session_state["rag_passages"], k=top_k)
-            if not retrieved:
-                st.info("No relevant passages found.")
-            else:
-                st.success(f"Found {len(retrieved)} relevant passages.")
-                context_text = ""
-                for score, passage, idx in retrieved:
-                    st.markdown(f"**Score:** {score:.3f}")
-                    st.markdown(textwrap.fill(passage, width=140))
-                    st.markdown("---")
-                    context_text += passage + "\n\n"
-
-                gemini_answer = None
-                if gemini_checkbox:
-                    try:
-                        st.info("Calling Gemini (this may take several seconds)...")
-                        gem_ans, gem_meta = call_gemini_generate_safe(ctx_text, user_question, timeout_sec=12)
-                        if gem_ans:
-                              st.subheader("Answer (Gemini)")
-                              st.write(gem_ans)
-                        else:
-                                st.warning(f"Gemini not available: {gem_meta}")
-                                # fallback
-                                st.subheader("Fallback (Extractive, humanized)")
-                                st.markdown(format_human_answer_from_retrieved(retrieved, user_question, df2))
-                    except Exception as e:
-                        st.error(f"Gemini call failed: {e}")
-                        gemini_answer = None
-
-                if gemini_answer:
-                    st.subheader("Answer from Gemini")
-                    st.write(gemini_answer)
+    if st.button("Run RAG", key="run_rag_ui"):
+        if not user_question or not user_question.strip():
+            st.warning("Please enter a question.")
+        elif st.session_state.get("rag_vect") is None or st.session_state.get("rag_mat") is None:
+            st.error("Retriever not ready. Check TF-IDF index build above (try lowering corpus rows / features).")
+        else:
+            try:
+                with st.spinner("Retrieving top-k passages..."):
+                    retrieved = safe_retrieve_top_k(user_question, st.session_state["rag_vect"], st.session_state["rag_mat"], st.session_state["rag_passages"], k=int(top_k))
+                if not retrieved:
+                    st.info("No relevant passages found. Try simpler question or increase Max corpus rows.")
                 else:
-                    st.subheader("Extractive fallback answer")
-                    summary = extractive_summary_from_passages([p for _, p, _ in retrieved], user_question, max_sentences=4)
-                    if summary:
-                        st.write(summary)
+                    st.success(f"Retrieved {len(retrieved)} passages.")
+                    ctx_text = ""
+                    for score, passage, idx in retrieved:
+                        st.markdown(f"**Score:** {score:.3f}")
+                        st.write(passage[:800])
+                        ctx_text += passage + "\n\n"
+
+                    gemini_answer = None
+                    if use_gemini:
+                        st.info("Calling Gemini (this may take up to ~12s)...")
+                        out, meta = call_gemini_generate_safe(ctx_text, user_question, timeout_sec=12)
+                        if out:
+                            gemini_answer = out
+                        else:
+                            st.warning(f"Gemini unavailable: {meta}")
+
+                    if gemini_answer:
+                        st.subheader("Answer (Gemini)")
+                        st.markdown(gemini_answer)
                     else:
-                        st.info("No extractive sentences found; see retrieved passages above.")
-        except Exception as err:
-            st.error("RAG pipeline failed — see details below.")
-            st.exception(err)
+                        st.subheader("Answer (Extractive, humanized)")
+                        st.markdown(format_human_answer_from_retrieved(retrieved, user_question, df2, max_examples=3))
+            except Exception as err:
+                st.error("RAG pipeline failed — see details below.")
+                st.exception(err)
+
+else:
+    st.info('👈 Configure columns + filters → Click **Run Analysis** 🚀')
